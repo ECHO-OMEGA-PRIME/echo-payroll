@@ -1,0 +1,30 @@
+name = "echo-payroll"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-payroll"
+database_id = "e348b54c-ebf9-49cb-bda9-5f86ed460b6a"
+
+[[kv_namespaces]]
+binding = "PR_CACHE"
+id = "34aea67228ab4fda9540205d88ba0d21"
+
+[triggers]
+crons = ["0 6 * * 1"]
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[[services]]
+binding = "EMAIL_SENDER"
+service = "echo-email-sender"
