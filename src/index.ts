@@ -146,13 +146,15 @@ export default {
       const b = await req.json() as any;
       const fields: string[] = [];
       const vals: any[] = [];
+      const ALLOWED_STR = ['first_name','last_name','email','phone','status','pay_type','department','title','ssn_last4','hire_date','termination_date'];
+      const ALLOWED_NUM = ['hourly_rate','salary','overtime_threshold'];
+      const ALLOWED_JSON = ['direct_deposit','deductions','benefits'];
       for (const [k, v] of Object.entries(b)) {
-        if (['id', 'company_id', 'created_at'].includes(k)) continue;
-        if (['direct_deposit', 'deductions', 'benefits'].includes(k)) {
+        if (ALLOWED_JSON.includes(k)) {
           fields.push(`${k}=?`); vals.push(JSON.stringify(v));
-        } else if (typeof v === 'string') {
+        } else if (ALLOWED_STR.includes(k) && typeof v === 'string') {
           fields.push(`${k}=?`); vals.push(sanitize(v));
-        } else if (typeof v === 'number') {
+        } else if (ALLOWED_NUM.includes(k) && typeof v === 'number') {
           fields.push(`${k}=?`); vals.push(v);
         }
       }
