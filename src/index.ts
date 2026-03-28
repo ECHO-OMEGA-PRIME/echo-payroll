@@ -94,6 +94,7 @@ export default {
     const m = req.method;
 
     // --- Public ---
+    if (p === '/') return json({ service: 'echo-payroll', version: '1.0.0', status: 'operational' });
     if (p === '/health') return json({ status: 'ok', service: 'echo-payroll', version: '1.0.0', timestamp: new Date().toISOString() });
 
     // --- Rate limit public endpoints ---
