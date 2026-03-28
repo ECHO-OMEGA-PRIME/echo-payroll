@@ -1,7 +1,7 @@
 // Echo Payroll v1.0.0 — AI-Powered Payroll Processing Platform
 // Cloudflare Worker — Gusto/ADP alternative
 
-interface Env { DB: D1Database; PR_CACHE: KVNamespace; ENGINE_RUNTIME: Fetcher; SHARED_BRAIN: Fetcher; EMAIL_SENDER: Fetcher; ECHO_API_KEY: string; }
+interface Env { DB: D1Database; PR_CACHE: KVNamespace; ENGINE_RUNTIME: Fetcher; SHARED_BRAIN: Fetcher; EMAIL_SENDER: Fetcher; ECHO_API_KEY: string; STRIPE_SECRET_KEY: string; STRIPE_WEBHOOK_SECRET: string; ANALYTICS: AnalyticsEngineDataset; }
 
 interface RLState { c: number; t: number; }
 const RL_WINDOW = 60_000;
@@ -86,22 +86,187 @@ const MEDICARE_ADDITIONAL_THRESHOLD = 200000;
 const FUTA_RATE = 0.006;
 const FUTA_WAGE_BASE = 7000;
 
+// ═══════════════ STRIPE VERIFICATION ═══════════════
+async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
+  const parts: Record<string, string> = {};
+  for (const p of sigHeader.split(',')) { const eq = p.indexOf('='); if (eq > 0) parts[p.slice(0, eq).trim()] = p.slice(eq + 1).trim(); }
+  const ts = parts['t']; const v1 = parts['v1'];
+  if (!ts || !v1) return false;
+  if (Math.abs(Date.now() / 1000 - parseInt(ts)) > 300) return false;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${ts}.${payload}`));
+  const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  if (expected.length !== v1.length) return false;
+  let diff = 0; for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ v1.charCodeAt(i);
+  return diff === 0;
+}
+
+async function stripeRequest(env: Env, method: string, endpoint: string, params?: Record<string, string>): Promise<any> {
+  const url = `https://api.stripe.com/v1${endpoint}`;
+  const opts: RequestInit = {
+    method,
+    headers: {
+      'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+  };
+  if (params) opts.body = new URLSearchParams(params).toString();
+  const resp = await fetch(url, opts);
+  return resp.json();
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     if (req.method === 'OPTIONS') return cors();
     const url = new URL(req.url);
     const p = url.pathname;
     const m = req.method;
+    try { env.ANALYTICS.writeDataPoint({ blobs: [m, p, '200'], doubles: [Date.now()], indexes: ['echo-payroll'] }); } catch {}
 
     // --- Public ---
-    if (p === '/') return json({ name: 'echo-payroll', status: 'ok', version: '1.0.0', docs: '/health', timestamp: new Date().toISOString() });
-    if (p === '/health') return json({ status: 'ok', service: 'echo-payroll', version: '1.0.0', timestamp: new Date().toISOString() });
+    if (p === '/') return json({ name: 'echo-payroll', status: 'ok', version: '2.0.0', docs: '/health', timestamp: new Date().toISOString() });
+    if (p === '/health') {
+      let dbOk = false;
+      try { await env.DB.prepare('SELECT 1').first(); dbOk = true; } catch {}
+      return json({ status: dbOk ? 'ok' : 'degraded', service: 'echo-payroll', version: '2.0.0', timestamp: new Date().toISOString(), db: dbOk ? 'connected' : 'error', stripe: env.STRIPE_SECRET_KEY ? 'configured' : 'not_configured' });
+    }
+
+    // ═══════════════ STRIPE WEBHOOK (exempt from auth + rate limiting) ═══════════════
+    if (m === 'POST' && p === '/webhooks/stripe') {
+      const sigHeader = req.headers.get('stripe-signature') || '';
+      const body = await req.text();
+      if (!await verifyStripeSignature(body, sigHeader, env.STRIPE_WEBHOOK_SECRET)) {
+        slog('warn', 'stripe_webhook_signature_failed');
+        return json({ error: 'Invalid signature' }, 401);
+      }
+      const event = JSON.parse(body);
+      slog('info', 'stripe_webhook_received', { type: event.type, id: event.id });
+      try {
+        switch (event.type) {
+          case 'payment_intent.succeeded': {
+            const pi = event.data.object;
+            const companyId = pi.metadata?.company_id;
+            const payRunId = pi.metadata?.pay_run_id;
+            if (companyId && payRunId) {
+              await env.DB.prepare("INSERT INTO stripe_payments (stripe_id,company_id,pay_run_id,amount,currency,status,payment_type,payment_method,created_at) VALUES (?,?,?,?,?,?,?,?,datetime('now'))").bind(pi.id, companyId, payRunId, pi.amount / 100, pi.currency, 'succeeded', 'payroll_deposit', 'card').run();
+              await env.DB.prepare("INSERT INTO activity_log (company_id,actor,action,target,details) VALUES (?,?,?,?,?)").bind(companyId, 'stripe', 'payment_succeeded', `payrun_${payRunId}`, `Stripe payment ${pi.id}: $${(pi.amount / 100).toFixed(2)}`).run();
+            }
+            break;
+          }
+          case 'payment_intent.payment_failed': {
+            const pi = event.data.object;
+            const companyId = pi.metadata?.company_id;
+            const payRunId = pi.metadata?.pay_run_id;
+            if (companyId) {
+              await env.DB.prepare("INSERT INTO stripe_payments (stripe_id,company_id,pay_run_id,amount,currency,status,payment_type,payment_method,failure_reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))").bind(pi.id, companyId, payRunId || null, pi.amount / 100, pi.currency, 'failed', 'payroll_deposit', 'card', pi.last_payment_error?.message || 'Unknown').run();
+            }
+            break;
+          }
+          case 'charge.refunded': {
+            const charge = event.data.object;
+            const companyId = charge.metadata?.company_id;
+            if (companyId) {
+              await env.DB.prepare("UPDATE stripe_payments SET status='refunded',updated_at=datetime('now') WHERE stripe_id=?").bind(charge.payment_intent).run();
+            }
+            break;
+          }
+        }
+      } catch (e: any) {
+        slog('error', 'stripe_webhook_processing_error', { error: e.message, event_type: event.type });
+      }
+      return json({ received: true });
+    }
 
     // --- Rate limit public endpoints ---
     const ip = req.headers.get('CF-Connecting-IP') || 'unknown';
 
     // --- Auth-protected API ---
     if (!authOk(req, env)) return json({ error: 'Unauthorized' }, 401);
+
+    // ═══════════════ STRIPE PAYMENT ENDPOINTS ═══════════════
+    if (m === 'POST' && p === '/api/stripe/create-payroll-payment') {
+      try {
+        const b = await req.json() as any;
+        if (!b.company_id || !b.pay_run_id || !b.amount) return json({ error: 'company_id, pay_run_id, amount required' }, 400);
+        const result = await stripeRequest(env, 'POST', '/payment_intents', {
+          amount: String(Math.round(b.amount * 100)),
+          currency: b.currency || 'usd',
+          'metadata[company_id]': String(b.company_id),
+          'metadata[pay_run_id]': String(b.pay_run_id),
+          'metadata[type]': 'payroll_deposit',
+          description: `Payroll deposit - Pay Run #${b.pay_run_id}`,
+          'payment_method_types[]': 'card',
+        });
+        slog('info', 'stripe_payment_intent_created', { company_id: b.company_id, pay_run_id: b.pay_run_id, amount: b.amount });
+        return json({ payment_intent: result });
+      } catch (e: any) {
+        slog('error', 'stripe_payment_create_failed', { error: e.message });
+        return json({ error: 'Payment creation failed', detail: e.message }, 500);
+      }
+    }
+    if (m === 'POST' && p === '/api/stripe/create-tax-payment') {
+      try {
+        const b = await req.json() as any;
+        if (!b.company_id || !b.amount || !b.tax_type) return json({ error: 'company_id, amount, tax_type required' }, 400);
+        const result = await stripeRequest(env, 'POST', '/payment_intents', {
+          amount: String(Math.round(b.amount * 100)),
+          currency: b.currency || 'usd',
+          'metadata[company_id]': String(b.company_id),
+          'metadata[tax_type]': b.tax_type,
+          'metadata[type]': 'payroll_tax',
+          'metadata[quarter]': b.quarter || '',
+          'metadata[year]': b.year || String(new Date().getFullYear()),
+          description: `Payroll tax payment - ${b.tax_type} Q${b.quarter || '?'}`,
+          'payment_method_types[]': 'card',
+        });
+        slog('info', 'stripe_tax_payment_created', { company_id: b.company_id, tax_type: b.tax_type, amount: b.amount });
+        return json({ payment_intent: result });
+      } catch (e: any) {
+        slog('error', 'stripe_tax_payment_failed', { error: e.message });
+        return json({ error: 'Tax payment creation failed', detail: e.message }, 500);
+      }
+    }
+    if (m === 'GET' && p === '/api/stripe/payments') {
+      const companyId = url.searchParams.get('company_id');
+      if (!companyId) return json({ error: 'company_id required' }, 400);
+      const status = url.searchParams.get('status');
+      let sql = 'SELECT * FROM stripe_payments WHERE company_id=?';
+      const binds: any[] = [companyId];
+      if (status) { sql += ' AND status=?'; binds.push(status); }
+      sql += ' ORDER BY created_at DESC LIMIT 100';
+      const r = await env.DB.prepare(sql).bind(...binds).all();
+      return json({ payments: r.results });
+    }
+
+    // ═══════════════ STRIPE SCHEMA MIGRATION ═══════════════
+    if (m === 'POST' && p === '/admin/migrate-stripe') {
+      try {
+        await env.DB.batch([
+          env.DB.prepare(`CREATE TABLE IF NOT EXISTS stripe_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stripe_id TEXT UNIQUE,
+            company_id INTEGER NOT NULL,
+            pay_run_id INTEGER,
+            amount REAL NOT NULL,
+            currency TEXT DEFAULT 'usd',
+            status TEXT DEFAULT 'pending',
+            payment_type TEXT DEFAULT 'payroll_deposit',
+            payment_method TEXT DEFAULT 'card',
+            failure_reason TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+          )`),
+          env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_stripe_company ON stripe_payments(company_id)`),
+          env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_stripe_status ON stripe_payments(status)`),
+          env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_stripe_payrun ON stripe_payments(pay_run_id)`),
+        ]);
+        slog('info', 'stripe_schema_migrated');
+        return json({ migrated: true, tables: ['stripe_payments'] });
+      } catch (e: any) {
+        slog('error', 'stripe_migration_failed', { error: e.message });
+        return json({ error: 'Migration failed', detail: e.message }, 500);
+      }
+    }
 
     try {
 
