@@ -96,6 +96,8 @@ export default {
     // --- Auth-protected API ---
     if (!authOk(req, env)) return json({ error: 'Unauthorized' }, 401);
 
+    try {
+
     // === Companies ===
     if (m === 'GET' && p === '/api/companies') {
       const r = await env.DB.prepare('SELECT * FROM companies WHERE status=? ORDER BY name').bind('active').all();
@@ -501,7 +503,14 @@ export default {
       return json({ activity: r.results });
     }
 
-    return json({ error: 'Not found' }, 404);
+    return json({ error: 'Not found', path: p }, 404);
+    } catch (e: any) {
+      if (e.message?.includes('JSON')) {
+        return json({ error: 'Invalid JSON body' }, 400);
+      }
+      console.error(`[echo-payroll] ${e.message}`);
+      return json({ error: 'Internal server error' }, 500);
+    }
   },
 
   async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
