@@ -94,13 +94,12 @@ export default {
     const m = req.method;
 
     // --- Public ---
-    if (p === '/') return json({ service: 'echo-payroll', version: '1.0.0', status: 'operational' });
+    if (p === '/') return json({ name: 'echo-payroll', status: 'ok', version: '1.0.0', docs: '/health', timestamp: new Date().toISOString() });
     if (p === '/health') return json({ status: 'ok', service: 'echo-payroll', version: '1.0.0', timestamp: new Date().toISOString() });
 
     // --- Rate limit public endpoints ---
     const ip = req.headers.get('CF-Connecting-IP') || 'unknown';
 
-    try {
     // --- Auth-protected API ---
     if (!authOk(req, env)) return json({ error: 'Unauthorized' }, 401);
 
@@ -219,14 +218,7 @@ export default {
     if (m === 'GET' && p.match(/^\/api\/payruns\/(\d+)$/)) {
       const id = p.split('/')[3];
       const run = await env.DB.prepare('SELECT * FROM pay_runs WHERE id=?').bind(id).first();
-      if (!run) } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Unknown error';
-      const stack = err instanceof Error ? err.stack : undefined;
-      slog('error', 'Unhandled request error', { method: m, path: p, error: msg, stack });
-      return json({ error: 'Internal server error', message: msg, path: p }, 500);
-    }
-
-    return json({ error: 'Not found' }, 404);
+      if (!run) return json({ error: 'Pay run not found' }, 404);
       const stubs = await env.DB.prepare('SELECT ps.*,e.first_name,e.last_name,e.employee_id as emp_code FROM pay_stubs ps JOIN employees e ON ps.employee_id=e.id WHERE ps.pay_run_id=? ORDER BY e.last_name').bind(id).all();
       return json({ pay_run: run, stubs: stubs.results });
     }
