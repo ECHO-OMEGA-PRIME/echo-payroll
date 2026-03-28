@@ -13,14 +13,13 @@ function sanitize(s: unknown, max = 2000): string {
 }
 
 function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' , 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'X-XSS-Protection': '1; mode=block', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()', 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains' }
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'X-XSS-Protection': '1; mode=block', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()', 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains' } });
+}
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
   const entry = { ts: new Date().toISOString(), level, worker: 'echo-payroll', version: '1.0.0', msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
-}
- });
 }
 
 function cors(): Response {
@@ -513,25 +512,31 @@ export default {
     }
 
     return json({ error: 'Not found', path: p }, 404);
-    } catch (e: any) {
-      if (e.message?.includes('JSON')) {
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Unknown error';
+      if (msg.includes('JSON')) {
         return json({ error: 'Invalid JSON body' }, 400);
       }
-      console.error(`[echo-payroll] Unhandled error: ${e.message}`);
-      return json({ error: 'Internal server error' }, 500);
+      console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', service: 'echo-payroll', msg, path: url.pathname }));
+      return json({ error: 'Internal server error', detail: msg }, 500);
     }
   },
 
   async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
-    // Weekly: generate compliance reminders, aggregate analytics
-    const companies = await env.DB.prepare('SELECT * FROM companies WHERE status=?').bind('active').all();
-    const today = new Date().toISOString().slice(0, 10);
+    try {
+      // Weekly: generate compliance reminders, aggregate analytics
+      const companies = await env.DB.prepare('SELECT * FROM companies WHERE status=?').bind('active').all();
+      const today = new Date().toISOString().slice(0, 10);
 
-    for (const co of companies.results as any[]) {
-      const empCount = await env.DB.prepare('SELECT COUNT(*) as c FROM employees WHERE company_id=? AND status=?').bind(co.id, 'active').first() as any;
-      const weekRuns = await env.DB.prepare("SELECT SUM(total_gross) as gross, SUM(total_taxes) as tax FROM pay_runs WHERE company_id=? AND status='processed' AND pay_date>=?").bind(co.id, new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10)).first() as any;
+      for (const co of companies.results as any[]) {
+        const empCount = await env.DB.prepare('SELECT COUNT(*) as c FROM employees WHERE company_id=? AND status=?').bind(co.id, 'active').first() as any;
+        const weekRuns = await env.DB.prepare("SELECT SUM(total_gross) as gross, SUM(total_taxes) as tax FROM pay_runs WHERE company_id=? AND status='processed' AND pay_date>=?").bind(co.id, new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10)).first() as any;
 
-      await env.DB.prepare('INSERT OR REPLACE INTO analytics_daily (company_id,date,payroll_total,tax_total,employee_count) VALUES (?,?,?,?,?)').bind(co.id, today, weekRuns?.gross || 0, weekRuns?.tax || 0, empCount?.c || 0).run();
+        await env.DB.prepare('INSERT OR REPLACE INTO analytics_daily (company_id,date,payroll_total,tax_total,employee_count) VALUES (?,?,?,?,?)').bind(co.id, today, weekRuns?.gross || 0, weekRuns?.tax || 0, empCount?.c || 0).run();
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Unknown error';
+      console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', service: 'echo-payroll', msg, handler: 'scheduled' }));
     }
   },
 };
