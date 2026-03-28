@@ -508,7 +508,7 @@ export default {
       if (e.message?.includes('JSON')) {
         return json({ error: 'Invalid JSON body' }, 400);
       }
-      console.error(`[echo-payroll] ${e.message}`);
+      console.error(`[echo-payroll] Unhandled error: ${e.message}`);
       return json({ error: 'Internal server error' }, 500);
     }
   },
